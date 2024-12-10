@@ -393,28 +393,41 @@ class LeggedRobot(BaseTask):
             rew = self._reward_termination() * self.reward_scales["termination"]
             self.rew_buf += rew
             self.episode_sums["termination"] += rew
+
     
-    def _get_downsampled_heightmap(self):
-        """Takes center 15x15 window of heightmap and downsamples to 9x9 for observations"""
-        # Get center 15x15 window
-        center = self.map_size // 2
-        window_size = 15
-        half_window = window_size // 2
-        downsampled_size = 8
-        stride = 2  # Skip every other point
+    def _get_height_observation(self):
+        """Returns 10x10 grid local to the robot with simulator height map values - 0.1 m resolution"""
+        # Physical dimensions desired
+        samples_per_side = 10      # 10 x 10 grid (Affect observation space size)
 
-        # Get center 15x15 window for all environments
-        center_heightmap = self.immediate_heightfields[:, 
-                                                    center-half_window:center+half_window+1,
-                                                    center-half_window:center+half_window+1]
-        # Shape: (num_envs, 15, 15)
+        # Get robot's current position in world coordinates
+        base_pos = self.root_states[:, 0:3]  # Using first env's robot position
+        
+        # Initialize the result grid
+        height_observation = torch.zeros((self.num_envs, samples_per_side, samples_per_side), dtype=torch.int16, device=self.device)
 
-        # Downsample to 8x8 using strided slicing
-        downsampled = center_heightmap[:, ::stride, ::stride]
-        # Shape: (num_envs, 8, 8)
+        # Create meshgrid for sample positions
+        i, j = torch.meshgrid(torch.arange(samples_per_side, device=self.device), torch.arange(samples_per_side, device=self.device))
 
-        # Flatten to (num_envs, 64)
-        flattened = downsampled.reshape(self.num_envs, downsampled_size * downsampled_size)
+        # Calculate world coordinates for each sample point
+        world_x = base_pos[:, 0, None, None] + (i - samples_per_side/2)
+        world_y = base_pos[:, 1, None, None] + (j - samples_per_side/2)
+
+        # Convert world coordinates to heightfield indices
+        hf_row = torch.floor((world_x + self.terrain.cfg.border_size) / self.terrain.cfg.horizontal_scale).to(torch.int64)
+        hf_col = torch.floor((world_y + self.terrain.cfg.border_size) / self.terrain.cfg.horizontal_scale).to(torch.int64)
+
+        # Create mask for valid indices
+        valid_mask = (hf_row >= 0) & (hf_row < self.height_samples.shape[0]) & \
+                    (hf_col >= 0) & (hf_col < self.height_samples.shape[1])
+
+        # Sample heights using advanced indexing
+        hf_row = torch.clamp(hf_row, 0, self.height_samples.shape[0] - 1)
+        hf_col = torch.clamp(hf_col, 0, self.height_samples.shape[1] - 1)
+        height_observation = torch.where(valid_mask, self.height_samples[hf_row, hf_col], height_observation)
+        height_observation = height_observation * self.terrain.cfg.vertical_scale
+
+        flattened = height_observation.reshape(self.num_envs, samples_per_side * samples_per_side)
 
         return flattened
     
@@ -431,7 +444,7 @@ class LeggedRobot(BaseTask):
             self._ensure_float32(self.actions),
             self._ensure_float32(self.target_positions.view(self.num_envs, -1)),  # Flatten 4x3 target positions into 12D vector
             self._ensure_float32(self.contact_schedule[torch.arange(self.num_envs), self.current_phase]),  # Current desired contacts (4D)
-            self._ensure_float32(torch.tensor(self._get_downsampled_heightmap(), device=self.device))  # 81D
+            self._ensure_float32(torch.tensor(self._get_height_observation(), device=self.device))  # 81D
         ], dim=-1)
         
         return obs
