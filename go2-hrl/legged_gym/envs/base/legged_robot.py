@@ -42,6 +42,8 @@ class LeggedRobot(BaseTask):
             device_id (int): 0, 1, ...
             headless (bool): Run without rendering if True
         """
+        self.map_size = 27
+        self.cell_size = 0.05
         self.cfg = cfg
         self.sim_params = sim_params
         self.height_samples = None
@@ -90,7 +92,7 @@ class LeggedRobot(BaseTask):
         ])
 
         # Set reference velocity and angular momentum
-        tmls.ref_vel = np.array([0.15, 0, 0])  # Example: move forward at 0.1 m/s
+        tmls.ref_vel = np.array([0.25, 0, 0])  # Example: move forward at 0.1 m/s
         tmls.ref_angular_momentum = np.array([0, 0, 0])  # No angular momentum
         
         # Set gait pattern
@@ -207,14 +209,53 @@ class LeggedRobot(BaseTask):
         env_ids_for_optimization = torch.where(all_feet_completed)[0]
         
         if len(env_ids_for_optimization) > 0:
-            for i in env_ids_for_optimization:
-                # Run optimizer to get new footholds and contact schedule
-                optimal_footholds, phase_timing, contact_schedule = self.trajectory_optimizer(i)
+            # Only run optimizer during inference
+            if self.cfg.env.test:
+                for i in env_ids_for_optimization:
+                    # Run optimizer to get new footholds and contact schedule
+                    optimal_footholds, phase_timing, contact_schedule = self.trajectory_optimizer(i)
 
-                # Update targets and schedule for envs that completed all steps
-                self.target_positions[i] = optimal_footholds
-                self.phase_timings[i] = phase_timing
-                self.contact_schedule[i] = contact_schedule
+                    # Update targets and schedule for envs that completed all steps
+                    self.target_positions[i] = optimal_footholds
+                    self.phase_timings[i] = phase_timing
+                    self.contact_schedule[i] = contact_schedule
+            else:
+                current_positions = self.rigid_body_states[env_ids_for_optimization][:, self.feet_indices, :3] # [num_envs, 4, 3]
+                # Generate random forward steps between 0.1 and 0.4 meters
+                # Shape will be [num_envs, 1, 1] to broadcast correctly
+                random_steps = (torch.rand(len(env_ids_for_optimization), len(self.feet_indices), device=self.device) * 0.3 + 0.1)  # rand gives [0,1), we scale to [0.1,0.4)
+                                
+                # Move each foot forward by 0.1m-0.4m stochastically
+                new_positions = current_positions.clone()
+                new_positions[:, :, 0] += random_steps  # Add 0.1m to x coordinate
+                
+                # Convert world coordinates to terrain indices
+                terrain_resolution = 1.0 / self.terrain.cfg.horizontal_scale
+                x_idx = (new_positions[:, :, 0] * terrain_resolution).long()
+                y_idx = (new_positions[:, :, 1] * terrain_resolution).long()
+                
+                # Clamp indices to terrain bounds
+                x_idx = torch.clamp(x_idx, 0, self.height_samples.shape[0]-1)
+                y_idx = torch.clamp(y_idx, 0, self.height_samples.shape[1]-1)
+                
+                # Get height at each new position
+                heights = self.height_samples[x_idx, y_idx] * self.terrain.cfg.vertical_scale
+                heights = torch.clamp(heights, min=-0.05) # Clamp to prevent foothold targets in pits
+                new_positions[:, :, 2] = heights
+
+                # Use default phase timing and contact schedule during training
+                default_phase_timing = torch.tensor([0, 0.4, 0.8, 1.2, 1.6], device=self.device)
+                default_contact_schedule = torch.tensor([
+                    [1, 0, 1, 1],
+                    [1, 1, 1, 0],
+                    [0, 1, 1, 1],
+                    [1, 1, 0, 1]
+                ], device=self.device, dtype=torch.bool)
+                
+                # Update targets and schedule
+                self.target_positions[env_ids_for_optimization] = new_positions
+                self.phase_timings[env_ids_for_optimization] = default_phase_timing.unsqueeze(0).expand(len(env_ids_for_optimization), -1)
+                self.contact_schedule[env_ids_for_optimization] = default_contact_schedule.unsqueeze(0).expand(len(env_ids_for_optimization), -1, -1)
             
             # Reset tracking variables
             self.foot_completed_step[env_ids_for_optimization] = False
@@ -356,7 +397,7 @@ class LeggedRobot(BaseTask):
     def _get_downsampled_heightmap(self):
         """Takes center 15x15 window of heightmap and downsamples to 9x9 for observations"""
         # Get center 15x15 window
-        center = 27 // 2
+        center = self.map_size // 2
         window_size = 15
         half_window = window_size // 2
         downsampled_size = 8
@@ -663,7 +704,7 @@ class LeggedRobot(BaseTask):
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3) # shape: num_envs, num_bodies, xyz axis
 
         # Initialize heightmaps
-        self.immediate_heightfields = torch.zeros((self.num_envs, 27, 27), dtype=torch.int16, device=self.device, requires_grad=False)
+        self.immediate_heightfields = torch.zeros((self.num_envs, self.map_size, self.map_size), dtype=torch.int16, device=self.device, requires_grad=False)
 
         # Initialize tracking variables for footstep optimization
         self.foot_completed_step = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
@@ -1154,8 +1195,8 @@ class LeggedRobot(BaseTask):
         """Updates self.immediate_heightfield with height values in a 0.56m x 0.56m area around the robot, 
         sampled to a 14x14 grid"""
         # Physical dimensions desired
-        grid_cell_size = 0.05
-        samples_per_side = 27      # 14 x 14 grid (TODO: adjust however much u want)
+        grid_cell_size = self.cell_size
+        samples_per_side = self.map_size      # 14 x 14 grid (TODO: adjust however much u want)
         window_size_meters = grid_cell_size * (samples_per_side - 1)  # 3m x 3m window (TODO: Adjust however much you want)
 
         
@@ -1187,6 +1228,7 @@ class LeggedRobot(BaseTask):
         hf_row = torch.clamp(hf_row, 0, self.height_samples.shape[0] - 1)
         hf_col = torch.clamp(hf_col, 0, self.height_samples.shape[1] - 1)
         self.immediate_heightfields = torch.where(valid_mask, self.height_samples[hf_row, hf_col], self.immediate_heightfields)
+        self.immediate_heightfields = self.immediate_heightfields * self.terrain.cfg.vertical_scale
 
     def _check_feet_at_target(self, feet_positions, target_positions, threshold=0.02):
         """
